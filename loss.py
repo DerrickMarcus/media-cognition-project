@@ -1,0 +1,29 @@
+import torch
+import torch.nn.functional as F
+
+
+# 请在这里写出对比损失函数
+def contrastive_loss(image_embeds, text_embeds, temperature=0.07):
+    """
+    image_embeds, text_embeds: [batch, embed_dim]
+    """
+    # L2归一化
+    image_embeds = F.normalize(image_embeds, p=2, dim=1)
+    text_embeds = F.normalize(text_embeds, p=2, dim=1)
+
+    # 计算相似度矩阵 ：图像到文本方向、文本到图像方向
+    logits_image_to_text = torch.matmul(image_embeds, text_embeds.T) / temperature
+    logits_text_to_image = torch.matmul(text_embeds, image_embeds.T) / temperature
+
+    # 标签是每个样本对应的索引
+    batch_size = image_embeds.size(0)
+    labels = torch.arange(batch_size, device=image_embeds.device)
+
+    # InfoNCE 损失
+    loss_image_to_text = F.cross_entropy(logits_image_to_text, labels)
+    loss_text_to_image = F.cross_entropy(logits_text_to_image, labels)
+
+    # 双向损失
+    loss = (loss_image_to_text + loss_text_to_image) / 2
+
+    return loss
