@@ -1,4 +1,5 @@
 # train_and_eval.py
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -60,6 +61,10 @@ def evaluate_top_k(img_encoder, txt_encoder, dataloader, device, topk=(1, 5, 10)
     for i, k in enumerate(topk):
         print(f"Recall@{k}: {r_txt2img[i] * 100:.2f}%")
 
+    print("\n📈 Image → Text Retrieval:")
+    for i, k in enumerate(topk):
+        print(f"Recall@{k}: {r_img2txt[i] * 100:.2f}%")
+
     return r_txt2img, r_img2txt
 
 
@@ -101,34 +106,43 @@ def main():
     )
 
     train_dataloader = DataLoader(
-        train_dataset, batch_size=32, shuffle=True, num_workers=4, drop_last=True
+        train_dataset, batch_size=512, shuffle=True, num_workers=12, drop_last=True
     )
     # 为保证评估稳定，每个 batch 使用 batch_size=1
     val_dataloader = DataLoader(
-        val_dataset, batch_size=1, shuffle=False, num_workers=4, drop_last=False
+        val_dataset, batch_size=512, shuffle=False, num_workers=12, drop_last=False
     )
     test_dataloader = DataLoader(
-        test_dataset, batch_size=1, shuffle=False, num_workers=4, drop_last=False
+        test_dataset, batch_size=512, shuffle=False, num_workers=12, drop_last=False
     )
 
     # 构造模型（设定 embed_dim=256）
-    embed_dim = 256
+    embed_dim = 512
     img_encoder = ImageEncoder(embed_dim=embed_dim).to(device)
-    txt_encoder = TextEncoder(vocab_size, embed_dim=embed_dim).to(device)
+    txt_encoder = TextEncoder(
+        vocab_size, embed_dim=embed_dim, encoder_type="transformer"
+    ).to(device)
 
     # 优化器
     optimizer = torch.optim.Adam(
         list(img_encoder.parameters()) + list(txt_encoder.parameters()), lr=1e-4
     )
 
-    best_val_loss = float("inf")
-    epochs = 40
+    # best_val_loss = float("inf")
+    best_recall = 0.0
+    epochs = 30
+    train_losses = []
+    valid_losses = []
     for epoch in range(epochs):
+        # training
         img_encoder.train()
         txt_encoder.train()
         epoch_loss = 0.0
+        pbar = tqdm(
+            train_dataloader, desc=f"Train Epoch {epoch + 1}/{epochs}", unit="batch"
+        )
 
-        for images, captions_ids in train_dataloader:
+        for images, captions_ids in pbar:
             images = images.to(device)
             captions_ids = captions_ids.to(device)
 
@@ -141,28 +155,104 @@ def main():
             optimizer.step()
 
             epoch_loss += loss.item()
+            pbar.set_postfix(loss=loss.item())
 
         avg_train_loss = epoch_loss / len(train_dataloader)
+        train_losses.append(avg_train_loss)
+
+        # validation
+        img_encoder.eval()
+        txt_encoder.eval()
+        total_val_loss = 0.0
+        pbar = tqdm(
+            val_dataloader, desc=f"Validation Epoch {epoch + 1}/{epochs}", unit="batch"
+        )
+        with torch.no_grad():
+            for images, captions_ids in pbar:
+                images = images.to(device)
+                captions_ids = captions_ids.to(device)
+
+                image_embeds = img_encoder(images)
+                text_embeds = txt_encoder(captions_ids)
+                val_loss = contrastive_loss(image_embeds, text_embeds)
+                total_val_loss += val_loss.item()
+                pbar.set_postfix(loss=val_loss.item())
+
+        avg_val_loss = total_val_loss / len(val_dataloader)
+        valid_losses.append(avg_val_loss)
 
         print(
-            f"Epoch [{epoch + 1}/{epochs}]: Train Loss: {avg_train_loss:.4f} | Val Loss: {val_loss:.4f} | Test Loss: {test_loss:.4f}"
+            f"Epoch {epoch + 1}/{epochs}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}."
         )
 
-        # 如果验证集有改善，则保存最佳模型，这里需要同学们自己选择评估标准
+        topk = (1, 5, 10)
+        r_txt2img, r_img2txt = evaluate_top_k(
+            img_encoder, txt_encoder, val_dataloader, device, topk
+        )
+        avg_recall1 = (r_txt2img[0] + r_img2txt[0]) / 2
+        if avg_recall1 > best_recall:
+            best_recall = avg_recall1
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "img_encoder_state_dict": img_encoder.state_dict(),
+                    "txt_encoder_state_dict": txt_encoder.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "tokenizer_vocab": tokenizer.word2idx,
+                    "best_recall": best_recall,
+                },
+                "exp/chpts/best_clip_model_transformer.pth",
+            )
+            print(f"    > Best model updated at epoch {epoch + 1}.")
 
-        checkpoint = {
-            "epoch": epoch + 1,
-            "img_encoder_state_dict": img_encoder.state_dict(),
-            "txt_encoder_state_dict": txt_encoder.state_dict(),
-            "tokenizer_vocab": tokenizer.word2idx,
-            "best_val_loss": best_val_loss,
-        }
-        torch.save(checkpoint, "best_clip_model.pth")
-        print(f"    > Best model updated at epoch {epoch + 1} ")
+        # # 如果验证集有改善，则保存最佳模型，这里需要同学们自己选择评估标准
+        # if avg_val_loss < best_val_loss:
+        #     best_val_loss = avg_val_loss
+        #     # 保存模型
+        #     torch.save(
+        #         {
+        #             "epoch": epoch + 1,
+        #             "img_encoder_state_dict": img_encoder.state_dict(),
+        #             "txt_encoder_state_dict": txt_encoder.state_dict(),
+        #             "optimizer_state_dict": optimizer.state_dict(),
+        #             "tokenizer_vocab": tokenizer.word2idx,
+        #             "best_val_loss": best_val_loss,
+        #         },
+        #         "chpts/best_clip_model.pth",
+        #     )
+        #     print(f"    > Best model updated at epoch {epoch + 1} ")
+
+    plt.figure()
+    plt.plot(range(1, epochs + 1), train_losses, label="Train Loss")
+    plt.plot(range(1, epochs + 1), valid_losses, label="Valid Loss")
+    plt.title("Training & Validation Loss over Epochs")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("exp/images/loss_transformer.png")
+    plt.show()
 
     # 训练完成，最终在测试集上评估
-    final_test_loss = evaluate(img_encoder, txt_encoder, test_dataloader, device)
-    print(f"Final Test Loss: {final_test_loss:.4f}")
+    # final_test_loss = evaluate(img_encoder, txt_encoder, test_dataloader, device)
+    # print(f"Final Test Loss: {final_test_loss:.4f}")
+    total_test_loss = 0.0
+    pbar = tqdm(test_dataloader, desc="Final Test", unit="batch")
+    with torch.no_grad():
+        for images, captions_ids in pbar:
+            images = images.to(device)
+            captions_ids = captions_ids.to(device)
+
+            image_embeds = img_encoder(images)
+            text_embeds = txt_encoder(captions_ids)
+            test_loss = contrastive_loss(image_embeds, text_embeds)
+            total_test_loss += test_loss.item()
+            pbar.set_postfix(loss=test_loss.item())
+
+    avg_test_loss = total_test_loss / len(test_dataloader)
+    print(f"Final Test Loss: {avg_test_loss:.4f}.")
+    evaluate_top_k(img_encoder, txt_encoder, test_dataloader, device, topk=(1, 5, 10))
 
 
 if __name__ == "__main__":
