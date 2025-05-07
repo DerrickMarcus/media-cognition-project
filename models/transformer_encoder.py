@@ -45,6 +45,7 @@ class MultiHeadSelfAttention(nn.Module):
 
         attn_scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         if mask is not None:
+            mask = mask.unsqueeze(1).unsqueeze(2)
             attn_scores = attn_scores.masked_fill(mask == 0, float("-inf"))
         attn_weight = F.softmax(attn_scores, dim=-1)
         attn_output = torch.matmul(attn_weight, v).transpose(1, 2).reshape(B, T, D)
@@ -103,8 +104,7 @@ class TransformerTextEncoder(nn.Module):
         # captions: [B, T]
 
         # my code begin
-        B, T = captions.size()
-        x = self.embedding(captions) * math.sqrt(self.embedding.weight.shape[1])
+        x = self.embedding(captions) * math.sqrt(self.embedding.embedding_dim)
         x = self.pos_encoder(x)
         for layer in self.layers:
             x = layer(x)

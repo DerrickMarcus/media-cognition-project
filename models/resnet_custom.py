@@ -44,6 +44,7 @@ class BasicBlock(nn.Module):
         out = self.bn2(out)
 
         if self.downsample is not None:
+            # 如果下采样，则对 identity 分支做变换
             identity = self.downsample(x)
 
         # 残差连接

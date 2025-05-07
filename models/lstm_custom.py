@@ -11,6 +11,7 @@ class LSTMTextEncoder(nn.Module):
 
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=padding_idx)
         self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
 
         self.W_i = nn.Linear(embed_dim, hidden_dim)
         # 初始化输入门参数，U_i：上一个隐状态至隐状态
