@@ -117,20 +117,27 @@ def main():
     )
 
     # 构造模型（设定 embed_dim=256）
-    embed_dim = 512
+    embed_dim = 256
     img_encoder = ImageEncoder(embed_dim=embed_dim).to(device)
     txt_encoder = TextEncoder(
         vocab_size, embed_dim=embed_dim, encoder_type="transformer"
     ).to(device)
 
     # 优化器
-    optimizer = torch.optim.Adam(
-        list(img_encoder.parameters()) + list(txt_encoder.parameters()), lr=1e-4
+    # optimizer = torch.optim.Adam(
+    #     list(img_encoder.parameters()) + list(txt_encoder.parameters()), lr=1e-4
+    # )
+    optimizer = torch.optim.SGD(
+        list(img_encoder.parameters()) + list(txt_encoder.parameters()),
+        lr=1e-3,  # 通常 SGD 要比 Adam 用稍大的 lr
+        momentum=0.9,  # 动量
+        weight_decay=1e-4,  # 权重衰减
+        nesterov=True,  # 可选：Nesterov 动量
     )
 
     # best_val_loss = float("inf")
     best_recall = 0.0
-    epochs = 30
+    epochs = 40
     train_losses = []
     valid_losses = []
     for epoch in range(epochs):
