@@ -1,10 +1,18 @@
 # 媒体与认知 上机作业
 
+> 姓名：陈彦旭
+>
+> 班级：无24
+
+[toc]
+
+Tips: 改进部分位于“实验改进”章节。
+
 ## 整体框架
 
 本次上机实验的目标是搭建一个简单的多模态模型，通过图像和文本的对比学习，实现图像和文本之间的相互检索。
 
-模型的主题是一个图像编码器 Image Encoder 和一个文本编码器 Text Encoder，模型所学习的数据集是一组图片和若干条对与图像信息的文本描述 caption，Image Encoder 和 Text Encoder 分别对输入的图像和文本进行编码，得到图像和文本的特征向量 Embedding，并且是相同维度。在共享空间中，图像嵌入和文本嵌入两两之间计算余弦相似度，得到图像和文本之间的相似度矩阵。训练过程中，通过相似度矩阵计算 InfoNCE 损失函数，并自动反向传播更新模型参数，由此完成模型的训练。
+模型的主体是一个图像编码器 Image Encoder 和一个文本编码器 Text Encoder，模型所学习的数据集是一组图片和若干条对与图像信息的文本描述 caption，Image Encoder 和 Text Encoder 分别对输入的图像和文本进行编码，得到图像和文本的特征向量 Embedding，并且是相同维度。在共享空间中，图像嵌入和文本嵌入两两之间计算余弦相似度，得到图像和文本之间的相似度矩阵。训练过程中，通过相似度矩阵计算 InfoNCE 损失函数，并自动反向传播更新模型参数，由此完成模型的训练。
 
 ### 准备部分
 
@@ -173,6 +181,16 @@ Recall@5: 52.22%
 Recall@10: 61.10%
 ```
 
+上述训练过程总结为表格：
+
+|   Text encoder   | batch_size | embed_dim |    Recall@1    |    Recall@5    |   Recall@10    |
+| :--------------: | :--------: | :-------: | :------------: | :------------: | :------------: |
+|       LSTM       |    128     |    256    |  6.92%, 6.85%  | 20.19%, 20.61% | 30.45%, 31.39% |
+|       LSTM       |    256     |    256    | 26.32%, 26.32% | 50.12%, 47.01% | 59.47%, 56.08% |
+|   Transformer    |    512     |    256    | 28.32%, 29.19% | 53.53%, 52.22% | 63.00%, 61.10% |
+|   Transformer    |    512     |    512    | 27.11%, 27.95% | 51.71%, 49.58% | 60.75%, 58.18% |
+| Transformer, SGD |    512     |    256    | 23.41%, 24.67% | 46.37%, 44.51% | 54.57%, 53.81% |
+
 ## 可视化展示
 
 编写和运行可视化文件 `visualize.py` ，并随机从数据集中挑选几个 caption 作为输入，对输入文本进行检索。刚开始进行检索的时候发现会出现重复的情况，类似于这样：
@@ -217,6 +235,331 @@ Recall@10: 61.10%
 
 可见，模型对于包含 bike 信息的图像学习效果不如不够理想，低于平均水平。
 
+## 实验改进
+
+首先，我意识到之前的测试方法存在问题：虽然训练和验证过程中以 Recall@K 为评价指标保存模型，但是测试时使用的模型参数不是最佳权重的参数，而是训练过程中最后一次保存的模型参数。即使发生过拟合，也仍然保存着整个过程中的最佳参数。这也是为什么在我设置 `transformer, batch_size=512, embed_dim=256` 时，训练不同 epoch 的测试结果存在差异。因此我修正了这个错误，在测试前先重新加载回最佳模型参数。
+
+```py
+# test
+ckpt = torch.load(best_ckpt, map_location=device, weights_only=False)
+img_encoder.load_state_dict(ckpt["img_encoder_state"])
+txt_encoder.load_state_dict(ckpt["txt_encoder_state"])
+```
+
+改进之前，我尝试的不同超参数的模型中，性能最好的为“ResNet18 + Transformer, batch_size=512, embed_dim=256, Adam 优化器 lr=1e-4”，其 Recall@K 指标如下：
+
+```text
+Final Test Loss: 2.2557
+
+📈 Text → Image Retrieval:
+Recall@1: 29.63%
+Recall@5: 54.84%
+Recall@10: 64.16%
+
+📈 Image → Text Retrieval:
+Recall@1: 30.00%
+Recall@5: 53.63%
+Recall@10: 62.83%
+```
+
+---
+
+### Step 1
+
+(1) 首先，我对当前模型做出如下设置：
+
+将 batch_size 从512降低至128，实际上对于当前“ResNet18 + Transformer”，这两种情况训练出来的模型性能几乎相同，说明对于 Flickr8k 小规模数据集，每个批次128个负例已经足够，如果再增大则收益很小。但是后面使用较大模型 ResNet50, ViT-B/16, BERT 等，则需要 batch_size 设为较小的128防止显存不足。
+
+嵌入维度 embed_dim 仍为256。我尝试过增大为384但是性能略微下降。
+
+将优化器改为 AdamW，并使用权重衰减，用于防止过拟合。
+
+```py
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": img_encoder.parameters(), "lr": BASE_LR},
+            {"params": txt_encoder.parameters(), "lr": BASE_LR},
+        ],
+        weight_decay=1e-4,
+    )
+```
+
+使用学习率调度器，结合线性预热和余弦退火，在训练初期逐渐增加学习率，然后在训练后期逐渐降低学习率，使模型更好地收敛。
+
+```py
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warm_iters,
+        num_training_steps=total_iters,
+    )
+```
+
+开启梯度累计 `scaler = GradScaler(device="cuda")` ，将一个大批次的数据分成多个小批次，逐步累积梯度，最后一次性更新模型参数。只是当前模型较为轻量，累计步数设置为1，等同于没有开启。
+
+开启混合精度 `auto_cast()` ，降低显存占用。
+
+另外，我还尝试了将损失函数中的温度设置为可学习参数，但是经过训练发现性能明显下降。理论上大概率不会因为温度可学习而导致性能下降，训练时 torch 警告应该先更新学习率调度器再更新优化器，否则会跳过第一次学习率，但是我明明就是这么设置的，无法消除这个警告。另外也可能是因为损失函数变成了一个类，而不是普通函数的返回值，在 backword() 的时候可能出现了问题。无论怎样，我最终还是放弃了将温度设置为可学习参数。
+
+以这个模型为基准模型进行训练。模型权重保存为 `resnet18-trans.pth` 。得到：
+
+```text
+Final test loss: 2.1156
+
+📈 Text → Image Retrieval:
+Recall@1: 31.56%
+Recall@5: 57.02%
+Recall@10: 66.78%
+
+📈 Image → Text Retrieval:
+Recall@1: 33.19%
+Recall@5: 57.02%
+Recall@10: 65.72%
+```
+
+![202506011421442](https://cdn.jsdelivr.net/gh/DerrickMarcus/picgo-image/images/202506011421442.png)
+
+可见，相比于之前的模型，Recall@K 指标均有小幅度提升，说明使用新的优化器和调度器发挥了作用。训练集上损失降低至0.027左右，验证机上损失降低至2.14左右，相比于之前的模型损失更小。同时我发现，验证集损失收敛效果更好，在更深轮次中损失曲线保持平稳平滑且没有明显振荡。
+
+这里还发生了一个小插曲，我原先在这一步还加入了图像处理的 torchvision.transfroms，对图像随机缩放、裁剪至224x224、随即水平翻转、归一化，但是发现 Recall@K 指标反而大幅下降，最终的测试集结果仅为：
+
+```text
+📈 Text → Image Retrieval:
+Recall@1: 12.36%
+Recall@5: 29.26%
+Recall@10: 38.33%
+
+📈 Image → Text Retrieval:
+Recall@1: 13.07%
+Recall@5: 29.24%
+Recall@10: 37.99%
+```
+
+于是我放弃了使用这一步图像处理，打算最后确定好模型结构之后在考虑对数据集进行处理。
+
+---
+
+### Step 2
+
+(2) 图像编码器继续换为更深的网络 ResNet50(自定义，全参数)。模型权重保存为 `resnet50-trans.pth` 。训练结果为：
+
+```text
+Final test loss: 2.1881
+
+📈 Text → Image Retrieval:
+Recall@1: 26.74%
+Recall@5: 51.11%
+Recall@10: 61.52%
+
+📈 Image → Text Retrieval:
+Recall@1: 27.09%
+Recall@5: 51.26%
+Recall@10: 60.68%
+```
+
+![202506011422405](https://cdn.jsdelivr.net/gh/DerrickMarcus/picgo-image/images/202506011422405.png)
+
+性能指标有所下降，可见对于当前小规模数据集，网络并不是越深越好、越复杂越好。
+
+---
+
+### Step 3
+
+(3) 我尝试将自定义的 ResNet 模型替换为 torchvision.models 中的 ResNet18 预训练模型，冻结全部参数，只训练最后一层投影到共享空间的全连接层，训练结果为：
+
+```text
+Final test loss: 3.6008
+
+📈 Text → Image Retrieval:
+Recall@1: 8.87%
+Recall@5: 22.27%
+Recall@10: 30.75%
+
+📈 Image → Text Retrieval:
+Recall@1: 9.07%
+Recall@5: 23.04%
+Recall@10: 31.31%
+```
+
+可以发现，如果网络全部冻结则性能较差，因此解冻 ResNet18 的 layer4 。模型权重保存为 `pre-resnet18-trans.pth` 。结果如下：
+
+```text
+Final test loss: 2.0318
+
+📈 Text → Image Retrieval:
+Recall@1: 30.99%
+Recall@5: 56.50%
+Recall@10: 65.52%
+
+📈 Image → Text Retrieval:
+Recall@1: 31.51%
+Recall@5: 56.62%
+Recall@10: 65.69%
+```
+
+![202506011422527](https://cdn.jsdelivr.net/gh/DerrickMarcus/picgo-image/images/202506011422527.png)
+
+性能与自定义的 ResNet18 十分接近。
+
+---
+
+### Step 4
+
+(4) 继续使用 ResNet50 预训练模型，仍然是只训练 ResNet50 的 layer4 和投影层，模型权重保存为 `pre-resnet50-trans.pth` 。训练结果为：
+
+```text
+Final test loss: 1.8641
+
+📈 Text → Image Retrieval:
+Recall@1: 31.59%
+Recall@5: 59.12%
+Recall@10: 69.15%
+
+📈 Image → Text Retrieval:
+Recall@1: 32.40%
+Recall@5: 59.24%
+Recall@10: 68.76%
+```
+
+![202506011423957](https://cdn.jsdelivr.net/gh/DerrickMarcus/picgo-image/images/202506011423957.png)
+
+该结果是目前位置性能最好的模型。由此也可以看到使用预训练模型的好处：预训练模型已经在大规模数据集上训练过，学习到数据的主要特征且泛化能力更强，在我们这个任务所使用的小规模数据集上做微调就可以取得比较好的效果。预训练模型损失下将更快、更低，Top K 指标收敛速度更快，经过10轮训练左右就逐渐稳定，而自定义的全参数模型需要30-40轮训练才接近收敛。而且由于只训练最后几层参数，可以在相同的计算资源下使用更大更复杂的模型。
+
+---
+
+### Step 5
+
+(5) 我们已经对预训练 ResNet50 进行微调，我们将微调过后的 ResNet50 作为图像编码器，也就是加载权重 `pre-resnet50-trans.pth` 中图像编码器的状态 ，并将文本编码器换为预训练的 Bert 模型 `bert-base-uncased`，只训练其编码器 encoder 的最后几层、池化 pooler 层和投影层，其余部分冻结。模型权重保存为 `pre-resnet50-bert.pth` 训练结果为：
+
+```text
+Final test loss: 1.0672
+
+Recall@1: 44.49%
+Recall@5: 76.50%
+Recall@10: 83.91%
+
+📈 Image → Text Retrieval:
+Recall@1: 46.56%
+Recall@5: 76.57%
+Recall@10: 84.28%
+```
+
+![202506011426666](https://cdn.jsdelivr.net/gh/DerrickMarcus/picgo-image/images/202506011426666.png)
+
+使用 Bert 模型之后，词表长度增大为30522。模型性能有较大提升，Top 1 达到 40% 以上，提升了10多个百分点，而 Top 10 也超过了 80%。
+
+---
+
+### Step 6
+
+(6) 最后，文本编码器使用前面微调过后的 Bert 模型，也就是加载权重 `pre-resnet50-bert.pth` 中文本编码器的状态，将编码器换为 CLIP-ViT-B/16 预训练模型 `openai/clip-vit-base-patch16` ，只训练编码器的最后一层和投影层，其余部分冻结。模型权重保存为 `pre-clipvit-bert.pth` 。训练结果为：
+
+```text
+Final test loss: 0.8950
+
+📈 Text → Image Retrieval:
+Recall@1: 49.23%
+Recall@5: 80.65%
+Recall@10: 87.64%
+
+📈 Image → Text Retrieval:
+Recall@1: 49.48%
+Recall@5: 80.82%
+Recall@10: 87.77%
+```
+
+![202506011527756](https://cdn.jsdelivr.net/gh/DerrickMarcus/picgo-image/images/202506011527756.png)
+
+随着模型复杂度提升，训练时间也大大增加。Top K 指标进一步提升，Top 1 接近50%，Top 10 超过了87%。
+
+其实最后我还计划将图像编码器和文本编码器全部替换为预训练模型 CLIPVisionModel + CLIPTextModel，但是本实验的最终目的就是搭建一个简单的 CLIP 模型，如果这样做就相当于全部借用现有的成熟模型了，因此我没有这样进一步修改。
+
+---
+
+### Step 7
+
+上述改进和训练结果总结为：
+
+|    Image Encoder     | Text Encoder |                Else                |  Top K: Text to Image  |  Top K: Image to Text  |
+| :------------------: | :----------: | :--------------------------------: | :--------------------: | :--------------------: |
+|   自定义 ResNet18    | Transformer  |        Adam 优化器 lr=1e-4         | 29.63%, 54.84%, 64.16% | 30.00%, 53.63%, 62.83% |
+|   自定义 ResNet18    | Transformer  | AdamW 优化器，动态学习率，混合精度 | 31.56%, 57.02%, 66.78% | 33.19%, 57.02%, 65.72% |
+|   自定义 ResNet50    | Transformer  |                同上                | 26.74%, 51.11%, 61.52% | 27.09%, 51.26%, 60.68% |
+|   预训练 ResNet18    | Transformer  |  ResNet18 全部冻结，只训练投影层   | 8.87%, 22.27%, 30.75%  | 9.07%, 23.04%, 31.31%  |
+|   预训练 ResNet18    | Transformer  |  只训练 ResNet 的 layer4 和投影层  | 30.99%, 56.50%, 65.52% | 31.51%, 56.62%, 65.69% |
+|   预训练 ResNet50    | Transformer  |                同上                | 31.59%, 59.12%, 69.15% | 32.40%, 59.24%, 68.76% |
+|   预训练 ResNet50    | 预训练 Bert  |    只训练 Bert 最后几层和投影层    | 44.49%, 76.50%, 83.91% | 46.56%, 76.57%, 84.28% |
+| 预训练 CLIP-ViT-B/16 | 预训练 Bert  |    只训练 ViT 最后一层和投影层     | 49.23%, 80.65%, 87.64% | 49.48%, 80.82%, 87.77% |
+
+按照顺序绘制图像：
+
+![202506011637412](https://cdn.jsdelivr.net/gh/DerrickMarcus/picgo-image/images/202506011637412.png)
+
+---
+
+### Step 8
+
+(8) 可视化检索，仍然使用中期实验中使用过的样例：
+
+Caption: "One brown dog is bearing its teeth at another brown dog with a green collar in a park ."
+
+![202506011557280](https://cdn.jsdelivr.net/gh/DerrickMarcus/picgo-image/images/202506011557280.png)
+
+正确结果出现在第4位。
+
+Caption: "A girl with a short haircut and eyebrow piercing bites her finger and crosses her arms ."
+
+![202506011604222](https://cdn.jsdelivr.net/gh/DerrickMarcus/picgo-image/images/202506011604222.png)
+
+![202506011603328](https://cdn.jsdelivr.net/gh/DerrickMarcus/picgo-image/images/202506011603328.jpg)
+
+前10位中并没有正确结果，同样，中期实验中的模型也没有找到正确结果。
+
+Caption: "A snowboard rider jumping high on his snowboard in the snow ."
+
+![202506011615232](https://cdn.jsdelivr.net/gh/DerrickMarcus/picgo-image/images/202506011615232.png)
+
+正确结果出现在第1位，而中期实验的模型在前5位中没有找到正确答案。滑雪场景有较多相似图片造成干扰，改进后的模型对这些图片的区分度更好。
+
+Caption: "A man in a white shirt walks in the tall grass holding a stick ."
+
+![202506011620857](https://cdn.jsdelivr.net/gh/DerrickMarcus/picgo-image/images/202506011620857.png)
+
+正确结果出现在第1位。
+
+Caption: "The boy in the black sweatshirt is hitting the yellow object held by the boy in the blue sweatshirt ."
+
+![202506011622867](https://cdn.jsdelivr.net/gh/DerrickMarcus/picgo-image/images/202506011622867.png)
+
+正确结果出现在第1位。
+
+Caption: "A man riding a bike wearing flannel shirt , plaid pants and a blue backpack while riding on a street near buildings and parked cars ."
+
+![202506011552215](https://cdn.jsdelivr.net/gh/DerrickMarcus/picgo-image/images/202506011552215.png)
+
+正确结果出现在第1位，而中期实验中模型对这条 caption 检索的前10条都没有正确答案。
+
+Caption: "Young girl hanging on a vine ."
+
+![202506011626254](https://cdn.jsdelivr.net/gh/DerrickMarcus/picgo-image/images/202506011626254.png)
+
+对于很短、信息量较少的文本描述，现在的模型也能够找出正确结果且出现在第1位。后面的几张图片和正确答案很相似，模型也能够正确区分。
+
 ## 实验总结
 
 刚开始接触多模态模型的时候，我以为是较为复杂的结构，但其实思路和流程很清晰，只是两个解耦的文本编码器和图像编码器，分别输出对文本和推向的嵌入向量，然后两两对比学习。在初步的模型搭建好之后，检索指标已经表现较好，Top1 Accuracy/Recall@1 接近30%，Recall@10 超过60%。但是后续还可以尝试对模型进行多方面的改进和优化，可以进一步改进模型结构、增加模型的复杂度，训练数据方面对数据集进行预处理，超参数方面尝试多种优化器和学习方法等。
+
+---
+
+在改进过程中，我尝试了多种方法。从超参数角度，我使用 AdamW 优化器和权重衰减，使用调度器实现学习率动态调整，开启混合精度和梯度累计，对图像做随机变换，损失函数中温度设置为可学习参数等。从模型角度，我尝试更加复杂的模型结构、对预训练模型进行微调。最终模型的性能相比于中期实验有了一定的提升（我认为还是主要来自于模型的改进，而超参数的改进主要影响模型学习过程中的行为、预防过拟合与振荡等）。我也深刻体会到预训练模型带来的便利，通过微调和蒸馏等优化技术，可以让模型很好地适应特定任务，也能减小过拟合风险，提高模型泛化能力。但同时大模型训练并非易事，每一个参数的设置、每一个训练操作的设置都可能对结果产生显著影响，在基于经验设置的基础之上，我们还可以先跑几轮小轮次的训练，观察损失函数和检索指标的变化趋势，仔细调整，再慎重设定参数之后再开始真正训练。这次实验也遇到过一些问题和各种报错警告（例如无法加载 Huggingface 上的模型等，但是借助 AI 工具和搜索，最终手动下载模型保存在本地），但是同在不断解决问题、性能不断提升的过程中我也收获了很多。
+
+相比于之前，我增加的内容主要有：
+
+1. 文件 `resnet_custom.py` 中添加 ResNet34, ResNet50 等自定义模型。
+2. 图像编码器 `image_encoder.py` 中添加预训练 ResNet 模型类 `PretrainedResNet` ，且可自定义类型；添加预训练 CLIP-ViT-B/16 模型类 `PretrainedCLIPViT` 。
+3. 文本编码器 `text_encoder.py` 中添加预训练 Bert 模型类 `PretrainedBert` 。
+4. 文件 `data_loader.py` 中添数据集类 `Flickr8kDatasetV2` ，用于 ResNet + Bert 模型；添加数据集类 `Flickr8kDatasetV3` ，用于 CLIP-ViT + Bert 模型。
+5. 训练文件 `train_bert.py` 用于训练 ResNet + Bert 模型。
+6. 训练文件 `train_clip.py` 用于训练 CLIP-ViT + Bert 模型。
+7. 文件 `loss_learned.py` 损失函数，其中温度为可学习参数。
+8. 可视化文件 `visualize.py` 对中期实验中 ResNet18 + Transformer 模型进行可视化检索。
+9. 可视化文件 `visualize_final.py` 对最终结果 CLIP-ViT + Bert 模型进行可视化检索。

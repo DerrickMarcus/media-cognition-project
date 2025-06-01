@@ -9,15 +9,18 @@ from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
-from transformers import get_cosine_schedule_with_warmup
+from transformers import (
+    BertTokenizer,
+    CLIPImageProcessor,
+    get_cosine_schedule_with_warmup,
+)
 
-from data_loader import Flickr8kDataset
+from data_loader import Flickr8kDatasetV3
 
 # from loss_learned import ContrastiveLoss
 from loss import contrastive_loss
-from models.image_encoder import ImageEncoder
-from models.text_encoder import TextEncoder
-from utils import SimpleTokenizer
+from models.image_encoder import PretrainedCLIPViT
+from models.text_encoder import PretrainedBert
 
 
 # 供同学们参考
@@ -29,12 +32,15 @@ def evaluate_top_k(img_encoder, txt_encoder, dataloader, device, topk=(1, 5, 10)
     all_text_embeds = []
 
     with torch.no_grad():
-        for images, captions_ids in tqdm(dataloader, desc="Extracting embeddings"):
+        for images, captions_ids, attn_mask in tqdm(
+            dataloader, desc="Extracting embeddings"
+        ):
             images = images.to(device)
             captions_ids = captions_ids.to(device)
+            attn_mask = attn_mask.to(device)
 
             image_embed = img_encoder(images)  # [1, dim]
-            text_embed = txt_encoder(captions_ids)  # [1, dim]
+            text_embed = txt_encoder(captions_ids, attn_mask)  # [1, dim]
 
             all_image_embeds.append(image_embed.cpu())
             all_text_embeds.append(text_embed.cpu())
@@ -87,19 +93,25 @@ def main():
     BASE_LR = 5e-5  # 配合 scheduler 的初始 LR
 
     # 文件路径，根据实际调整
-    token_file = "Flickr8k/captions.txt"  # 总的 captions 文件，用于构建词表
+    # token_file = "Flickr8k/captions.txt"  # 总的 captions 文件，用于构建词表
     train_token_file = "Flickr8k/train_captions.txt"  # 训练集，格式： image,caption
     val_token_file = "Flickr8k/val_captions.txt"  # 验证集
     test_token_file = "Flickr8k/test_captions.txt"  # 测试集
 
     # 读取所有 caption 用于构建总词表（假设以 tab 分隔，如果不是，请修改 split 参数）
-    with open(token_file, "r", encoding="utf-8") as f:
-        captions = [line.strip().split(",")[1] for line in f if line.strip()]
+    # with open(token_file, "r", encoding="utf-8") as f:
+    #     captions = [line.strip().split(",")[1] for line in f if line.strip()]
 
     # 构建统一的 tokenizer
-    tokenizer = SimpleTokenizer(captions, min_freq=1)
-    vocab_size = len(tokenizer)
+    bert_tokenizer = BertTokenizer.from_pretrained(
+        "cache/bert-base-uncased",
+        local_files_only=True,
+    )
+    vocab_size = len(bert_tokenizer)
     print(f"Vocabulary size: {vocab_size}")
+    clip_processor = CLIPImageProcessor.from_pretrained(
+        "cache/clip-vit-base-patch16", local_files_only=True
+    )
 
     # 图像变换
     train_tf = transforms.Compose(
@@ -122,10 +134,11 @@ def main():
     # 构建数据集与 DataLoader
     # captions 文件格式： image<TAB>caption
     train_dataloader = DataLoader(
-        train_dataset=Flickr8kDataset(
+        Flickr8kDatasetV3(
             root_dir="Flickr8k/images",
             captions_file=train_token_file,
-            tokenizer=tokenizer,
+            bert_tokenizer=bert_tokenizer,
+            clip_processor=clip_processor,
             # transform=train_tf,
         ),
         batch_size=BATCH_TRAIN,
@@ -135,10 +148,11 @@ def main():
         drop_last=True,
     )
     val_dataloader = DataLoader(
-        Flickr8kDataset(
+        Flickr8kDatasetV3(
             root_dir="Flickr8k/images",
             captions_file=val_token_file,
-            tokenizer=tokenizer,
+            bert_tokenizer=bert_tokenizer,
+            clip_processor=clip_processor,
             # transform=eval_tf,
         ),
         batch_size=BATCH_EVAL,
@@ -148,10 +162,11 @@ def main():
         drop_last=False,
     )
     test_dataloader = DataLoader(
-        Flickr8kDataset(
+        Flickr8kDatasetV3(
             root_dir="Flickr8k/images",
             captions_file=test_token_file,
-            tokenizer=tokenizer,
+            bert_tokenizer=bert_tokenizer,
+            clip_processor=clip_processor,
             # transform=eval_tf,
         ),
         batch_size=BATCH_EVAL,
@@ -162,12 +177,21 @@ def main():
     )
 
     # 构造模型（设定 embed_dim=256）
-    # img_encoder = PretrainedResNet(
-    #     embed_dim=EMBED_DIM, model_name="resnet50", freeze_backbone=True
+    # img_encoder = ImageEncoder(embed_dim=EMBED_DIM, model_name="resnet50").to(device)
+    img_encoder = PretrainedCLIPViT(
+        embed_dim=EMBED_DIM,
+        model_name="cache/clip-vit-base-patch16",
+        freeze_backbone=True,
+        num_unfrozen_layers=1,
+    ).to(device)
+    # txt_encoder = TextEncoder(
+    #     vocab_size, embed_dim=EMBED_DIM, model_name="transformer"
     # ).to(device)
-    img_encoder = ImageEncoder(embed_dim=EMBED_DIM, model_name="resnet50").to(device)
-    txt_encoder = TextEncoder(
-        vocab_size, embed_dim=EMBED_DIM, model_name="transformer"
+    txt_encoder = PretrainedBert(
+        embed_dim=EMBED_DIM,
+        model_name="cache/bert-base-uncased",
+        freeze_backbone=True,
+        num_unfrozen_layers=4,
     ).to(device)
     # contra_loss = ContrastiveLoss(init_temperature=0.07).to(device)
 
@@ -175,8 +199,6 @@ def main():
     optimizer = torch.optim.AdamW(
         [
             {"params": img_encoder.parameters(), "lr": BASE_LR},
-            # {"params": img_encoder.proj.parameters(), "lr": BASE_LR},
-            # {"params": img_encoder.backbone.layer4.parameters(), "lr": BASE_LR},
             {"params": txt_encoder.parameters(), "lr": BASE_LR},
             # {"params": contra_loss.parameters(), "lr": 1e-4},
         ],
@@ -191,10 +213,17 @@ def main():
     )
     scaler = GradScaler(device="cuda")
 
+    # 使用之前训练好的 ResNet50 模型参数
+    ckpt = torch.load(
+        "exp/ckpts/pre-resnet50-bert.pth", map_location=device, weights_only=False
+    )
+    # img_encoder.load_state_dict(ckpt["img_encoder_state"])
+    txt_encoder.load_state_dict(ckpt["txt_encoder_state"])
+
     pathlib.Path("exp/ckpts").mkdir(parents=True, exist_ok=True)
     pathlib.Path("exp/images").mkdir(parents=True, exist_ok=True)
-    best_ckpt = "exp/ckpts/resnet50.pth"
-    loss_curve = "exp/images/resnet50.png"
+    best_ckpt = "exp/ckpts/pre-clipvit-bert.pth"
+    loss_curve = "exp/images/pre-clipvit-bert.png"
     best_recall_i2t, best_recall_t2i = 0.0, 0.0
     train_losses, valid_losses = [], []
     recall_i2t, recall_t2i = [], []
@@ -210,12 +239,14 @@ def main():
             train_dataloader, desc=f"Train epoch {epoch + 1}/{EPOCHS}", unit="batch"
         )
 
-        for step, (images, captions_ids) in enumerate(pbar):
+        for step, (images, captions_ids, attn_mask) in enumerate(pbar):
             images = images.to(device)
             captions_ids = captions_ids.to(device)
+            attn_mask = attn_mask.to(device)
 
             image_embeds = img_encoder(images)  # [batch, embed_dim]
-            text_embeds = txt_encoder(captions_ids)  # [batch, embed_dim]
+            text_embeds = txt_encoder(captions_ids, attn_mask)  # [batch, embed_dim]
+
             with autocast(device_type="cuda"):
                 loss = contrastive_loss(image_embeds, text_embeds) / ACCUM_STEPS
                 # loss = contra_loss(image_embeds, text_embeds) / ACCUM_STEPS
@@ -245,12 +276,13 @@ def main():
             val_dataloader, desc=f"Validation epoch {epoch + 1}/{EPOCHS}", unit="batch"
         )
         with torch.no_grad(), autocast(device_type="cuda"):
-            for images, captions_ids in pbar:
+            for images, captions_ids, attn_mask in pbar:
                 images = images.to(device)
                 captions_ids = captions_ids.to(device)
+                attn_mask = attn_mask.to(device)
 
                 image_embeds = img_encoder(images)
-                text_embeds = txt_encoder(captions_ids)
+                text_embeds = txt_encoder(captions_ids, attn_mask)
                 val_loss = contrastive_loss(image_embeds, text_embeds)
                 # val_loss = contra_loss(image_embeds, text_embeds)
                 total_val_loss += val_loss.item()
@@ -278,7 +310,7 @@ def main():
                     "optimizer_state": optimizer.state_dict(),
                     "scheduler_state": scheduler.state_dict(),
                     "scaler_state": scaler.state_dict(),
-                    "vocab": tokenizer.word2idx,
+                    # "vocab": bert_tokenizer.word2idx,
                     "recall_i2t": best_recall_i2t,
                     "recall_t2i": best_recall_t2i,
                 },
@@ -344,12 +376,13 @@ def main():
     pbar = tqdm(test_dataloader, desc="Final test", unit="batch")
 
     with torch.no_grad(), autocast(device_type="cuda"):
-        for images, captions_ids in pbar:
+        for images, captions_ids, attn_mask in pbar:
             images = images.to(device)
             captions_ids = captions_ids.to(device)
+            attn_mask = attn_mask.to(device)
 
             image_embeds = img_encoder(images)
-            text_embeds = txt_encoder(captions_ids)
+            text_embeds = txt_encoder(captions_ids, attn_mask)
             test_loss = contrastive_loss(image_embeds, text_embeds)
             # test_loss = contra_loss(image_embeds, text_embeds)
 

@@ -38,6 +38,7 @@ def main():
     txt_encoder.eval()
 
     dataset = Flickr8kDataset("Flickr8k/images", "Flickr8k/val_captions.txt", tokenizer)
+
     # all_embeds = []
     # with torch.no_grad():
     #     for fn, _ in dataset.pairs:
@@ -46,6 +47,8 @@ def main():
     #         all_embeds.append(img_encoder(x).cpu())
     # image_embeds = torch.cat(all_embeds, dim=0)
     # image_embeds = F.normalize(image_embeds, dim=1)
+
+    # 对图片去重
     all_fns = [fn for fn, _ in dataset.pairs]
     unique_fns = list(dict.fromkeys(all_fns))
 
@@ -70,6 +73,7 @@ def main():
     sims = (text_emb @ image_embeds.t()).squeeze(0)
     vals, idxs = sims.topk(topk, largest=True)
 
+    # 绘制图像
     fig, axes = plt.subplots(1, topk, figsize=(3 * topk, 3))
     fig.suptitle(f"Caption: {query}", fontsize=12)
     for i, (score, idx) in enumerate(zip(vals, idxs), start=1):
